@@ -3,10 +3,13 @@
 package prompter_test
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -834,6 +837,209 @@ func TestSurveyPrompter(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, 0, selectValue)
 	})
+
+	t.Run("Input handles Meta escape sequences", func(t *testing.T) {
+		tests := []struct {
+			name      string
+			input     string
+			wantValue string
+		}{
+			{
+				name:      "option right",
+				input:     "See how this crashes:\x1bf\r",
+				wantValue: "See how this crashes:",
+			},
+			{
+				name:      "option left",
+				input:     "hello world\x1bbc\r",
+				wantValue: "hello cworld",
+			},
+			{
+				name:      "option delete",
+				input:     "hello world\x1b\x7f\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "double escape",
+				input:     "hello world\x1b\x1b\r",
+				wantValue: "hello world",
+			},
+			{
+				name:      "unknown meta key",
+				input:     "hello \x1bq\r",
+				wantValue: "hello q",
+			},
+			{
+				name:      "ctrl-w word delete",
+				input:     "hello world\x17\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "modified delete sequence",
+				input:     "hello world\x1b[3;3~\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "modified backspace tilde sequence",
+				input:     "hello world\x1b[127;3~\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "modified ctrl-h tilde sequence",
+				input:     "hello world\x1b[8;3~\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "csi u option backspace",
+				input:     "hello world\x1b[127;3u\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "csi u option ctrl-h backspace",
+				input:     "hello world\x1b[8;3u\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "csi u option delete",
+				input:     "hello world\x1b[3;3u\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "modifyOtherKeys option backspace",
+				input:     "hello world\x1b[27;3;127~\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "modifyOtherKeys option d",
+				input:     "hello world\x1b[27;3;100~\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "kitty option d",
+				input:     "hello world\x1b[100;3u\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "kitty numpad option delete",
+				input:     "hello world\x1b[57426;3u\r",
+				wantValue: "hello ",
+			},
+			{
+				name:      "modified arrow sequence",
+				input:     "hello world\x1b[1;3Dc\r",
+				wantValue: "hello cworld",
+			},
+			{
+				name:      "kitty modified arrow sequence",
+				input:     "hello world\x1b[1;3:1Dc\r",
+				wantValue: "hello cworld",
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				terminal := newPromptTerminal()
+				p := prompter.New(editorCmd, &iostreams.IOStreams{
+					In:     terminal,
+					Out:    terminal,
+					ErrOut: terminal,
+				})
+
+				type result struct {
+					value string
+					err   error
+				}
+				resultCh := make(chan result, 1)
+				go func() {
+					inputValue, err := p.Input("Title", "")
+					resultCh <- result{value: inputValue, err: err}
+				}()
+
+				terminal.waitForOutput(t, "Title")
+				terminal.Send(tt.input)
+
+				var got result
+				select {
+				case got = <-resultCh:
+				case <-time.After(2 * time.Second):
+					t.Fatal("Input did not complete")
+				}
+				require.NoError(t, got.err)
+				inputValue := got.value
+				assert.Equal(t, tt.wantValue, inputValue)
+			})
+		}
+	})
+}
+
+type promptTerminal struct {
+	input  chan byte
+	output bytes.Buffer
+	mu     sync.Mutex
+}
+
+func newPromptTerminal() *promptTerminal {
+	return &promptTerminal{
+		input: make(chan byte, 4096),
+	}
+}
+
+func (t *promptTerminal) Fd() uintptr {
+	return os.Stdin.Fd()
+}
+
+func (t *promptTerminal) Close() error {
+	close(t.input)
+	return nil
+}
+
+func (t *promptTerminal) Read(p []byte) (int, error) {
+	b, ok := <-t.input
+	if !ok {
+		return 0, io.EOF
+	}
+	p[0] = b
+	return 1, nil
+}
+
+func (t *promptTerminal) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	_, _ = t.output.Write(p)
+	t.mu.Unlock()
+
+	if bytes.Contains(p, []byte("\x1b[6n")) {
+		t.Send("\x1b[1;1R")
+	}
+
+	return len(p), nil
+}
+
+func (t *promptTerminal) Send(s string) {
+	for _, b := range []byte(s) {
+		t.input <- b
+	}
+}
+
+func (t *promptTerminal) waitForOutput(testingT *testing.T, want string) {
+	testingT.Helper()
+	deadline := time.After(2 * time.Second)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+
+	for {
+		t.mu.Lock()
+		output := t.output.String()
+		t.mu.Unlock()
+		if strings.Contains(output, want) {
+			return
+		}
+
+		select {
+		case <-deadline:
+			testingT.Fatalf("timed out waiting for output %q; got %q", want, output)
+		case <-tick.C:
+		}
+	}
 }
 
 func newTestVirtualTerminal(t *testing.T) *expect.Console {
